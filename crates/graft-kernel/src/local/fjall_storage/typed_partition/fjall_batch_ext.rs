@@ -1,4 +1,4 @@
-use fjall::Batch;
+use fjall::WriteBatch;
 
 use super::TypedPartition;
 
@@ -19,14 +19,14 @@ pub trait FjallBatchExt {
     );
 }
 
-impl FjallBatchExt for Batch {
+impl FjallBatchExt for WriteBatch {
     fn insert_typed<K: FjallRepr, V: FjallRepr>(
         &mut self,
         partition: &TypedPartition<K, V>,
         key: K,
         val: V,
     ) {
-        self.insert(&partition.partition, key.into_slice(), val.into_slice())
+        self.insert(&partition.keyspace, key.into_slice(), val.into_slice())
     }
 
     fn remove_typed<K: FjallRepr, V: FjallRepr>(
@@ -34,6 +34,6 @@ impl FjallBatchExt for Batch {
         partition: &TypedPartition<K, V>,
         key: K,
     ) {
-        self.remove(&partition.partition, key.into_slice())
+        self.remove(&partition.keyspace, key.into_slice())
     }
 }

@@ -1,7 +1,7 @@
 use std::{fmt::Debug, ops::RangeInclusive, path::Path, sync::Arc};
 
 use bytestring::ByteString;
-use fjall::{Batch, Instant, KvSeparationOptions, PartitionCreateOptions};
+use fjall::{KeyspaceCreateOptions, KvSeparationOptions};
 use graft_core::{
     PageCount, PageIdx, SegmentId, VolumeId,
     checkpoints::CachedCheckpoints,
@@ -55,7 +55,7 @@ pub enum FjallStorageErr {
 }
 
 pub struct FjallStorage {
-    keyspace: fjall::Keyspace,
+    db: fjall::Database,
 
     /// This partition allows grafts to be identified by a tag.
     /// The graft a tag points at can be changed.
@@ -94,16 +94,18 @@ impl Debug for FjallStorage {
 
 impl FjallStorage {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, FjallStorageErr> {
-        Self::open_config(fjall::Config::new(path))
+        Self::open_config(fjall::Database::builder(path))
     }
 
     pub fn open_temporary() -> Result<Self, FjallStorageErr> {
         let path = tempfile::tempdir()?.keep();
-        Self::open_config(fjall::Config::new(path).temporary(true))
+        Self::open_config(fjall::Database::builder(path).temporary(true))
     }
 
-    fn open_config(config: fjall::Config) -> Result<Self, FjallStorageErr> {
-        let keyspace = config.open()?;
+    fn open_config(
+        builder: fjall::DatabaseBuilder<fjall::Database>,
+    ) -> Result<Self, FjallStorageErr> {
+        let keyspace = builder.open()?;
         let tags = TypedPartition::open(&keyspace, "tags", Default::default())?;
         let grafts = TypedPartition::open(&keyspace, "grafts", Default::default())?;
         let checkpoints = TypedPartition::open(&keyspace, "checkpoints", Default::default())?;
@@ -111,11 +113,11 @@ impl FjallStorage {
         let pages = TypedPartition::open(
             &keyspace,
             "pages",
-            PartitionCreateOptions::default().with_kv_separation(KvSeparationOptions::default()),
+            KeyspaceCreateOptions::default().with_kv_separation(KvSeparationOptions::default()),
         )?;
 
         Ok(Self {
-            keyspace,
+            db: keyspace,
             tags,
             grafts,
             checkpoints,
@@ -160,11 +162,13 @@ impl FjallStorage {
         sid: &SegmentId,
         pages: RangeInclusive<PageIdx>,
     ) -> Result<(), FjallStorageErr> {
+        let snapshot = self.db.snapshot();
+
         // PageKeys are stored in descending order
         let keyrange =
             PageKey::new(sid.clone(), *pages.end())..=PageKey::new(sid.clone(), *pages.start());
-        let mut batch = self.keyspace.batch();
-        let mut iter = self.pages.snapshot().range(keyrange);
+        let mut batch = self.db.batch();
+        let mut iter = self.pages.snapshot(&snapshot).range(keyrange);
         while let Some((key, _)) = iter.try_next()? {
             batch.remove_typed(&self.pages, key);
         }
@@ -267,42 +271,32 @@ impl FjallStorage {
 
 pub struct ReadGuard<'a> {
     storage: &'a FjallStorage,
-    seqno: Instant,
-}
-
-impl Drop for ReadGuard<'_> {
-    fn drop(&mut self) {
-        // IMPORTANT: Decrement snapshot count
-        self.storage.keyspace.snapshot_tracker.close(self.seqno);
-    }
+    snapshot: fjall::Snapshot,
 }
 
 impl<'a> ReadGuard<'a> {
     fn open(storage: &'a FjallStorage) -> ReadGuard<'a> {
-        let seqno = storage.keyspace.instant();
-        // IMPORTANT: Increment snapshot count
-        storage.keyspace.snapshot_tracker.open(seqno);
-        Self { storage, seqno }
+        Self { storage, snapshot: storage.db.snapshot() }
     }
 
-    fn _tags(&self) -> TypedPartitionSnapshot<ByteString, VolumeId> {
-        self.storage.tags.snapshot_at(self.seqno)
+    fn _tags(&self) -> TypedPartitionSnapshot<'_, ByteString, VolumeId> {
+        self.storage.tags.snapshot(&self.snapshot)
     }
 
-    fn _grafts(&self) -> TypedPartitionSnapshot<VolumeId, Graft> {
-        self.storage.grafts.snapshot_at(self.seqno)
+    fn _grafts(&self) -> TypedPartitionSnapshot<'_, VolumeId, Graft> {
+        self.storage.grafts.snapshot(&self.snapshot)
     }
 
-    fn _checkpoints(&self) -> TypedPartitionSnapshot<VolumeId, CachedCheckpoints> {
-        self.storage.checkpoints.snapshot_at(self.seqno)
+    fn _checkpoints(&self) -> TypedPartitionSnapshot<'_, VolumeId, CachedCheckpoints> {
+        self.storage.checkpoints.snapshot(&self.snapshot)
     }
 
-    fn _log(&self) -> TypedPartitionSnapshot<VolumeRef, Commit> {
-        self.storage.log.snapshot_at(self.seqno)
+    fn _log(&self) -> TypedPartitionSnapshot<'_, VolumeRef, Commit> {
+        self.storage.log.snapshot(&self.snapshot)
     }
 
-    fn _pages(&self) -> TypedPartitionSnapshot<PageKey, Page> {
-        self.storage.pages.snapshot_at(self.seqno)
+    fn _pages(&self) -> TypedPartitionSnapshot<'_, PageKey, Page> {
+        self.storage.pages.snapshot(&self.snapshot)
     }
 
     pub fn iter_tags(
@@ -586,12 +580,12 @@ impl<'a> ReadGuard<'a> {
 
 pub struct WriteBatch<'a> {
     storage: &'a FjallStorage,
-    batch: Batch,
+    batch: fjall::WriteBatch,
 }
 
 impl<'a> WriteBatch<'a> {
     fn open(storage: &'a FjallStorage) -> Self {
-        Self { storage, batch: storage.keyspace.batch() }
+        Self { storage, batch: storage.db.batch() }
     }
     pub fn write_tag(&mut self, tag: &str, graft: VolumeId) {
         self.batch

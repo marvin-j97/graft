@@ -5,7 +5,7 @@ use std::{
 };
 
 use culprit::{Culprit, ResultExt};
-use fjall::{Keyspace, PartitionCreateOptions, Slice};
+use fjall::{Database, KeyspaceCreateOptions, Slice};
 use tryiter::TryIteratorExt;
 
 use crate::local::fjall_storage::{
@@ -20,7 +20,7 @@ type Result<T> = culprit::Result<T, FjallStorageErr>;
 
 #[derive(Clone)]
 pub struct TypedPartition<K, V> {
-    partition: fjall::Partition,
+    pub(super) keyspace: fjall::Keyspace,
     _phantom: PhantomData<(K, V)>,
 }
 
@@ -29,48 +29,42 @@ where
     K: FjallRepr,
     V: FjallRepr,
 {
-    pub fn open(keyspace: &Keyspace, name: &str, opts: PartitionCreateOptions) -> Result<Self> {
+    pub fn open(db: &Database, name: &str, opts: KeyspaceCreateOptions) -> Result<Self> {
         Ok(Self {
-            partition: keyspace.open_partition(name, opts)?,
+            keyspace: db.keyspace(name, opts)?,
             _phantom: PhantomData,
         })
     }
 
     #[inline]
     pub fn insert(&self, key: K, val: V) -> Result<()> {
-        self.partition.insert(key.into_slice(), val.into_slice())?;
+        self.keyspace.insert(key.into_slice(), val.into_slice())?;
         Ok(())
     }
 
     #[inline]
     pub fn remove(&self, key: K) -> Result<()> {
-        self.partition.remove(key.into_slice())?;
+        self.keyspace.remove(key.into_slice())?;
         Ok(())
     }
 
     #[inline]
-    pub fn snapshot(&self) -> TypedPartitionSnapshot<K, V> {
+    pub fn snapshot<'a>(&self, snapshot: &'a fjall::Snapshot) -> TypedPartitionSnapshot<'a, K, V> {
         TypedPartitionSnapshot {
-            snapshot: self.partition.snapshot(),
-            _phantom: PhantomData,
-        }
-    }
-
-    #[inline]
-    pub fn snapshot_at(&self, seqno: fjall::Instant) -> TypedPartitionSnapshot<K, V> {
-        TypedPartitionSnapshot {
-            snapshot: self.partition.snapshot_at(seqno),
+            keyspace: self.keyspace.clone(),
+            snapshot,
             _phantom: PhantomData,
         }
     }
 }
 
-pub struct TypedPartitionSnapshot<K, V> {
-    snapshot: fjall::Snapshot,
+pub struct TypedPartitionSnapshot<'a, K, V> {
+    keyspace: fjall::Keyspace,
+    snapshot: &'a fjall::Snapshot,
     _phantom: PhantomData<(K, V)>,
 }
 
-impl<K, V> TypedPartitionSnapshot<K, V>
+impl<'a, K, V> TypedPartitionSnapshot<'a, K, V>
 where
     K: FjallRepr,
     V: FjallRepr,
@@ -81,7 +75,9 @@ where
         B: FjallReprRef + ?Sized,
         K: Borrow<B>,
     {
-        self.snapshot.contains_key(key.as_slice()).or_into_ctx()
+        self.snapshot
+            .contains_key(&self.keyspace, key.as_slice())
+            .or_into_ctx()
     }
 
     /// Retrieve the value corresponding to the key
@@ -90,7 +86,7 @@ where
         B: FjallReprRef + ?Sized,
         K: Borrow<B>,
     {
-        if let Some(slice) = self.snapshot.get(key.as_slice())? {
+        if let Some(slice) = self.snapshot.get(&self.keyspace, key.as_slice())? {
             return Ok(Some(V::try_from_slice(slice).or_into_ctx()?));
         }
         Ok(None)
@@ -98,7 +94,7 @@ where
 
     /// An optimized version of get when key is owned
     pub fn get_owned(&self, key: K) -> Result<Option<V>> {
-        if let Some(slice) = self.snapshot.get(key.into_slice())? {
+        if let Some(slice) = self.snapshot.get(&self.keyspace, key.into_slice())? {
             return Ok(Some(V::try_from_slice(slice).or_into_ctx()?));
         }
         Ok(None)
@@ -113,7 +109,7 @@ where
             range.end_bound().map(|b| b.clone().into_slice()),
         );
         self.snapshot
-            .range(r)
+            .range(&self.keyspace, r)
             .err_into::<Culprit<FjallStorageErr>>()
             .map_ok(|(k, _)| K::try_from_slice(k).or_into_ctx())
     }
@@ -127,7 +123,7 @@ where
             range.end_bound().map(|b| b.clone().into_slice()),
         );
         self.snapshot
-            .range(r)
+            .range(&self.keyspace, r)
             .err_into::<Culprit<FjallStorageErr>>()
             .map_ok(|(k, v)| {
                 Ok((
@@ -140,21 +136,21 @@ where
     /// iterate all of the values in the partition
     pub fn values(&self) -> impl Iterator<Item = Result<V>> + use<K, V> {
         self.snapshot
-            .values()
+            .values(&self.keyspace)
             .err_into::<Culprit<FjallStorageErr>>()
             .map_ok(|v| V::try_from_slice(v).or_into_ctx())
     }
 
-    pub fn prefix<'a, P>(
+    pub fn prefix<'p, P>(
         &self,
-        prefix: &'a P,
-    ) -> impl Iterator<Item = Result<(K, V)>> + use<'a, P, K, V>
+        prefix: &'p P,
+    ) -> impl Iterator<Item = Result<(K, V)>> + use<'p, P, K, V>
     where
         K: FjallKeyPrefix<Prefix = P>,
         P: AsRef<[u8]>,
     {
         self.snapshot
-            .prefix(prefix)
+            .prefix(&self.keyspace, prefix)
             .err_into::<Culprit<FjallStorageErr>>()
             .map_ok(|(k, v)| {
                 Ok((

@@ -47,7 +47,7 @@ pub trait FjallReprRef {
 
 pub trait FjallRepr: FjallReprRef + Clone {
     /// Converts a Fjall Slice into Self.
-    fn try_from_slice(slice: Slice) -> Result<Self, DecodeErr>;
+    fn try_from_guard<T: lsm_tree::Guard>(slice: &fjall::Guard) -> Result<Self, DecodeErr>;
 }
 
 impl FjallReprRef for str {

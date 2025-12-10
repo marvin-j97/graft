@@ -26,7 +26,7 @@ impl FjallReprRef for VolumeId {
 
 impl FjallRepr for VolumeId {
     #[inline]
-    fn try_from_slice(slice: Slice) -> Result<Self, DecodeErr> {
+    fn try_from_guard<T: lsm_tree::Guard>(guard: &fjall::Guard<T>) -> Result<Self, DecodeErr> {
         VolumeId::try_from(Bytes::from(slice)).or_into_ctx()
     }
 }
